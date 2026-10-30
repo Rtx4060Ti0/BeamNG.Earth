@@ -1,0 +1,32 @@
+{
+  "sign_no_entry": {
+    "name": "sign_no_entry",
+    "mapTo": "sign_no_entry",
+    "class": "Material",
+    "Stages": [
+      {
+        "colorMap": "/levels/beamng_earth/art/shapes/beamngEarth/sign_no_entry.png",
+        "diffuseColor": [
+          1,
+          1,
+          1,
+          1
+        ],
+        "specular": [
+          0.5,
+          0.5,
+          0.5,
+          1.0
+        ],
+        "specularPower": 20,
+        "pixelSpecular": true
+      },
+      {},
+      {},
+      {}
+    ],
+    "alphaTest": true,
+    "alphaRef": 127,
+    "doubleSided": false
+  }
+}
