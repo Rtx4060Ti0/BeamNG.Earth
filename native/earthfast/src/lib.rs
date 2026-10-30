@@ -1550,12 +1550,23 @@ fn grade_points<'py>(py: Python<'py>, px: PyReadonlyArray1<'py, f64>, pyy: PyRea
                     // (a carriageway first: a road's cutting band reaching over another road's carriageway at another level
                     // (its "climb" was that road's embankment) does not pull that road's ground; a bridge's abutment sank
                     // 2.5 m under the deck into the street below, a wall cars hit, GitHub #108 Meppen)
-                    let on_other_car = carid[idx] >= 0 && carid[idx] != rid[s] && (target - carz[idx]).abs() > wall_cut;
-                    let yields = d > rh[s] && (on_other_car
-                        || (bid[idx] >= 0 && bid[idx] != rid[s] && (target - bz[idx]).abs() > wall_cut));
-                    if w > 0.0 && !drop && !yields && !(d > hs && ahead < side && target < top[idx] - wall_cut) {
+                    // A binary height threshold removed a neighbour's full weight in one sample:
+                    // on the A7 a smooth lower road made the motorway jump by 0.8 m. Fade its
+                    // contribution before reaching that threshold, also across its carriageway edge.
+                    let separation = |delta: f64| smooth((delta - 0.25) / (wall_cut - 0.25).max(0.25));
+                    let car_yield = if carid[idx] >= 0 && carid[idx] != rid[s] {
+                        separation((target - carz[idx]).abs())
+                    } else { 0.0 };
+                    let band_yield = if bid[idx] >= 0 && bid[idx] != rid[s] {
+                        separation((target - bz[idx]).abs())
+                    } else { 0.0 };
+                    let yields = car_yield.max(band_yield) * smooth((d - rh[s]) / 0.25);
+                    let abut_yield = if ahead < side {
+                        separation(top[idx] - target) * smooth((d - hs) / 0.25)
+                    } else { 0.0 };
+                    if w > 0.0 && !drop {
                         let r = d / blend_r;
-                        let mut wb = w / (1.0 + r * r);
+                        let mut wb = w / (1.0 + r * r) * (1.0 - yields) * (1.0 - abut_yield);
                         if sep {
                             let rf = cz[idx] / csum[idx].max(1e-12);
                             let f = cmax[idx] * smooth(((target - rf).abs() - sep_from) / (sep_full - sep_from))
