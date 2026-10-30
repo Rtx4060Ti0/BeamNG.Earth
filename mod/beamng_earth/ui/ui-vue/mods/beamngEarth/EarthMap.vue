@@ -50,7 +50,7 @@
           <line :x1="g.x1" :y1="g.y1" :x2="g.x2" :y2="g.y2" :class="g.cls" />
           <text v-if="g.label" :x="g.lx" :y="g.ly" class="grid-label">{{ g.label }}</text>
         </g>
-        <template v-if="layersOn">
+        <template v-if="layersOn || francePlacesOn">
           <text v-for="l in countryLabels" :key="'c' + l.name" :x="l.x" :y="l.y" class="layer-country">{{ l.name }}</text>
           <g v-for="l in placeLabels" :key="'p' + l.name + l.x.toFixed(0)">
             <circle :cx="l.x" :cy="l.y" :r="l.rank ? 3 : 2" class="layer-dot" />
@@ -136,6 +136,7 @@
           <label class="layer-opt"><input type="radio" value="dark" v-model="baseLayer" /> Dark</label>
           <div class="panel-sub">Overlays</div>
           <label class="layer-opt"><input type="checkbox" v-model="labelsOn" /> Roads &amp; labels</label>
+          <label class="layer-opt"><input type="checkbox" v-model="francePlacesOn" /> Villes et villages de France</label>
           <label class="layer-opt"><input type="checkbox" v-model="layersOn" /> Borders &amp; places
             <span class="layer-hint">(world to city zoom)</span></label>
         </div>
@@ -290,6 +291,7 @@ import { useEvents } from "@/services/events"
 import { vBngOnUiNav } from "@/common/directives"
 import * as mm from "./mapmath.js"
 import layerData from "./maplayers.js"
+import francePlaces from "./franceplaces.js"
 
 const props = defineProps({ embedded: { type: Boolean, default: false } })
 const embedded = props.embedded
@@ -339,6 +341,8 @@ const BASE_LAYERS = new Set(["sat", "map", "dark"])
 const storedBase = stored("beamngEarth.map.base", "sat")
 const baseLayer = ref(BASE_LAYERS.has(storedBase) ? storedBase : "sat")
 const labelsOn = ref(stored("beamngEarth.map.labels", "0") === "1")
+const francePlacesOn = ref(stored("beamngEarth.map.francePlaces", "1") !== "0")
+watch(francePlacesOn, on => store("beamngEarth.map.francePlaces", on ? "1" : "0"))
 watch(baseLayer, v => store("beamngEarth.map.base", v))
 watch(labelsOn, on => store("beamngEarth.map.labels", on ? "1" : "0"))
 const layersPanel = ref(false)
@@ -440,6 +444,7 @@ const attributionText = computed(() => {
   if (!state.value.mapPort) return ""
   const sat = baseLayer.value === "sat"
   const parts = [mm.layerCredits(tileBaseLayer.value, labelsOn.value)]   // the EOX map / labels layers shown
+  if (francePlacesOn.value) parts.push("Villes et villages : © OpenStreetMap contributors, extrait France du 12/10/2026 (ODbL)")
   const cba = state.value.creditsByArea
   if (cba) {                                // only the imagery sources the view shows (the server's areas)
     const v = view.value
@@ -530,7 +535,10 @@ const placeLabels = computed(() => {
   const v = view.value
   // no z < 15 cap (the user, 2026-10-22: zoomed in past it, every place's name should stay, not just vanish):
   // placeMinZoom's highest value is ~9.7 (scalerank 8, not a capital), so nothing new appears past z ~10 anyway
-  return layersOn.value ? mm.visibleLabels(placePoints, v.lat, v.lon, v.z, w.value, h.value, { max: 80, norm: placeNorm }) : []
+  // Local PBF names work offline and stay available at street zoom. Larger
+  // settlements come first; visibleLabels avoids overlapping names.
+  const points = [...(francePlacesOn.value ? francePlaces : []), ...(layersOn.value ? placePoints : [])]
+  return mm.visibleLabels(points, v.lat, v.lon, v.z, w.value, h.value, { max: 80 })
 })
 
 // the lat/lon grid: a step that gives lines ~120-300 px apart
