@@ -22,6 +22,9 @@ local farfield = require('beamngEarth/farfield')
 local banner = require('beamngEarth/banner')
 local edgeguard = require('beamngEarth/edgeguard')
 local calls = S.calls
+-- This fixture tests connection recovery without building road tiles.
+local collidersReady = false
+require('beamngEarth/roads').readyAround = function() return collidersReady end
 
 local wire, wireN = {}, 0
 function jsonEncode(msg) wireN = wireN + 1; wire['k' .. wireN] = msg; return 'k' .. wireN end
@@ -228,14 +231,30 @@ end
 serverSend({ type = 'far_swap', anchorId = 1, id = 1, add = keys, remove = {}, dIn = 0, dOut = 0 })
 serverSend({ type = 'far_done', anchorId = 1, count = 4 })
 T.check(pumpUntil(function() return farfield.stats().live == 4 end, 100), 's1 tiles shown')
+T.check(st().placeWait ~= nil and simTimeAuthority.paused, 'initial placement waits for road collisions')
+local beforePlacementPose = #received('pose')
+veh.vel = vec3(9000, 0, 0) -- a paused cluster move may report an obsolete velocity
+T.check(pumpUntil(function() return #received('pose') > beforePlacementPose end, 30),
+  'placement hold sends a pose so the server can build the missing road colliders')
+local loadingPose = last('pose') or {}
+T.check(loadingPose.x == st().placeX and loadingPose.y == st().placeY
+  and loadingPose.vx == 0 and loadingPose.vy == 0 and loadingPose.speed == 0,
+  'placement pose targets the destination at rest, not the transient vehicle velocity')
+T.check(st().placeWait ~= nil and simTimeAuthority.paused,
+  'requesting the road tiles keeps physics paused until their colliders arrive')
+veh.vel = vec3()
+collidersReady = true
+frames(5)
+T.check(st().placeWait == nil and not simTimeAuthority.paused, 'initial placement finishes and releases its pause')
 local nPose = #received('pose')
 T.check(pumpUntil(function() return #received('pose') > nPose end, 30), 'poses')
 T.check(has(last('pose').sessions, 's1') and #last('pose').sessions == 1, 'pose.sessions: the s1 folder')
 T.check(farfield.session() == 's1', 'the far field knows its session')
 for _ = 1, 100 do frame() end
 T.check(core.banner().id == 'ok' and not shown(), 'all is well: the banner is hidden')
--- healthy: the guard never acts, even driving at the edge (terrain-follow's job)
-veh.pos, veh.vel = vec3(990, 0, 0.5), vec3(20, 0, 0)
+-- Healthy server: drive inside the collidable block while terrain-follow prepares the next one.
+-- The initial hold now resumes correctly; the edge guard also protects healthy servers.
+veh.pos, veh.vel = vec3(800, 0, 0.5), vec3(20, 0, 0)
 local sets = veh.sets
 frames(10)
 T.check(st().guard.mode ~= 'hold' and not st().guard.pausedByUs and veh.sets == sets and veh.vel.x == 20,
@@ -341,7 +360,7 @@ veh.pos, veh.vel = vec3(b.cx + 300, b.cy, 0.5), vec3(20, 0, 0)
 local nPt = #received('prepare_terrain')
 T.check(pumpUntil(function() return #received('prepare_terrain') > nPt end, 40), 'terrain-follow asks')
 frames(20)
-T.check(st().guard.mode == 'off', 'just asked: the guard waits (the server may be slow)')
+T.check(st().guard.mode ~= 'hold' and not simTimeAuthority.paused, 'just asked: the guard waits inside the block')
 for _ = 1, 60 * 20 do frame() end
 T.check(veh.pos.x <= ex1 - edgeguard.STOP_M + 0.5 and simTimeAuthority.paused,
   string.format('unanswered for STUCK_S: paused %.1f m inside the edge', ex1 - veh.pos.x))
