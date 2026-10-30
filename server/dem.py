@@ -30,6 +30,7 @@ import threading
 import time
 from collections import Counter, OrderedDict
 from concurrent.futures import ThreadPoolExecutor
+from urllib.parse import urlencode
 
 import numpy as np
 from PIL import Image
@@ -131,6 +132,35 @@ def coverage_index(doc):
     return out
 AWS = dict(name="aws-terrarium", ext="png", size=256,
            url="https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png")
+IGN = dict(name="ign-rge-alti", ext="bil", size=TILE, url="https://data.geopf.fr/wms-r")
+
+
+def ign_covers(key):
+    """Coarse metropolitan France/Corsica bounds; the service masks its actual coverage."""
+    import mapcells
+    west, south, east, north = mapcells.CellKey(*key).bounds()
+    return east > -5.6 and west < 9.7 and north > 41.3 and south < 51.2
+
+
+def source_url(src, z, x, y):
+    if src["name"] != IGN["name"]:
+        return src["url"].format(z=z, x=x, y=y)
+    span = 40075016.68557849
+    step = span / 2 ** z
+    box = (x * step - span / 2, span / 2 - (y + 1) * step,
+           (x + 1) * step - span / 2, span / 2 - y * step)
+    return src["url"] + "?" + urlencode(dict(SERVICE="WMS", VERSION="1.3.0", REQUEST="GetMap",
+        LAYERS="ELEVATION.ELEVATIONGRIDCOVERAGE.HIGHRES", STYLES="", CRS="EPSG:3857",
+        BBOX=",".join(format(v, ".9f") for v in box), WIDTH=TILE, HEIGHT=TILE, FORMAT="image/x-bil;bits=32"))
+
+
+def decode_ign(data):
+    """Raw float32 elevation, with unavailable/restricted pixels left for global fallback."""
+    if len(data) != TILE * TILE * 4:
+        raise ValueError("expected a 512 x 512 float32 BIL tile")
+    a = np.frombuffer(data, dtype="<f4").reshape(TILE, TILE).copy()
+    a[~np.isfinite(a) | (a < -500.) | (a > 9000.)] = np.nan
+    return a
 
 
 class DemUnavailable(IOError):
@@ -212,8 +242,10 @@ class Dem:
     # fetcher: the server's netfetch.Fetcher (shared rate limits); None = a Fetcher of its own.
     def __init__(self, cache_dir, fetch_workers=16, mem_tiles=None, fetcher=None):
         self.cache_dir = cache_dir
+        self.prefer_ign = os.environ.get("BNE_DEM_SOURCE", "").lower() == "ign"
         self.fetcher = fetcher if fetcher is not None else netfetch.Fetcher()
-        self.fetcher.register_chain("dem", (MAPTERHORN["url"], AWS["url"]))
+        sources = (IGN["url"],) if self.prefer_ign else ()
+        self.fetcher.register_chain("dem", sources + (MAPTERHORN["url"], AWS["url"]))
         self.pool = ThreadPoolExecutor(fetch_workers, thread_name_prefix="dem-fetch")
         # The urgent lane (urgent()): the anchor's first block after a teleport needs ~10 tiles and waited ~33 s
         # behind hundreds queued by the far field, the road plans and the ground ahead (2026-10-16; alone 0.9 s).
@@ -481,7 +513,7 @@ class Dem:
         if data is not None:
             self._count(src["name"] + ":disk")
             return data
-        url = src["url"].format(z=z, x=x, y=y)
+        url = source_url(src, z, x, y)
         if self.fetcher.miss_alive(miss, url):
             return None
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -521,7 +553,7 @@ class Dem:
 
     def _probe(self, k):
         try:
-            return self._download(MAPTERHORN, *k)
+            return self._download(IGN if self.prefer_ign and ign_covers(k) else MAPTERHORN, *k)
         except netfetch.FetchError:
             return None
         finally:
@@ -543,10 +575,11 @@ class Dem:
         now): the rest waits for the next call. Errors skip the tile (asked again on demand)."""
         got = 0
         for z, x, y in keys:
-            if os.path.exists(self._path(MAPTERHORN, z, x, y)):
+            src = IGN if self.prefer_ign and ign_covers((z, x, y)) else MAPTERHORN
+            if os.path.exists(self._path(src, z, x, y)):
                 continue
             try:
-                if self._download(MAPTERHORN, z, x, y, kind="prefetch") is not None:
+                if self._download(src, z, x, y, kind="prefetch") is not None:
                     got += 1
             except netfetch.Deferred:
                 return got, True
@@ -558,6 +591,8 @@ class Dem:
         """True when Mapterhorn tile (z, x, y) needs no download: on disk, a 404 remembered, or not in Mapterhorn's
         file list (_listed; those never land on disk, and routeahead.py's bar stopped short of its total). For
         routeahead.py's progress count: no tile fetch (the file list is read once per session)."""
+        if self.prefer_ign and ign_covers((z, x, y)):
+            return os.path.exists(self._path(IGN, z, x, y))
         if os.path.exists(self._path(MAPTERHORN, z, x, y)):
             return True
         if os.path.exists(os.path.join(self.cache_dir, MAPTERHORN["name"], str(z), str(x), f"{y}.404")):
@@ -588,7 +623,7 @@ class Dem:
         server sent no length) leaves the disk cache and raises netfetch.BadResponse, so the chain
         fails over now and the tile is asked again later instead of failing every session."""
         try:
-            return decode_terrarium(data, src["size"])
+            return decode_ign(data) if src["name"] == IGN["name"] else decode_terrarium(data, src["size"])
         except (OSError, ValueError) as e:
             try:
                 os.remove(self._path(src, z, x, y))
@@ -616,7 +651,8 @@ class Dem:
     # --- the decoded mirror (MIRROR_MB) ----------------------------------------------------------
     def _mirror_path(self, key):
         z, x, y = key
-        return os.path.join(self.cache_dir, "decoded", f"v{DECODED_VERSION}", f"g{int(self.ground_filter)}", str(z),
+        variant = f"g{int(self.ground_filter)}" + ("-ign" if self.prefer_ign else "")
+        return os.path.join(self.cache_dir, "decoded", f"v{DECODED_VERSION}", variant, str(z),
                             str(x), f"{y}.npy")
 
     def _mirror_get(self, key):
@@ -703,7 +739,7 @@ class Dem:
         stay (no failover, no fetch failed on the way), written to the mirror."""
         got = self._mirror_get(key)
         if got is not None:
-            self.served.setdefault(key, MAPTERHORN["name"])
+            self.served.setdefault(key, IGN["name"] if self.prefer_ign and ign_covers(key) else MAPTERHORN["name"])
             return got
         prev = getattr(self._local, "partial", False)
         self._local.partial = False
@@ -713,13 +749,33 @@ class Dem:
             partial = self._local.partial
         finally:
             self._local.partial = prev or partial
-        if not partial and a is not None and self.served.get(key) == MAPTERHORN["name"] and MIRROR_MB > 0:
+        if not partial and a is not None and self.served.get(key) in (MAPTERHORN["name"], IGN["name"]) and MIRROR_MB > 0:
             got = self._mirror_put(key, a)
             if got is not None:
                 return got
         return a
 
     def _make_tile(self, key):
+        if self.prefer_ign and ign_covers(key):
+            try:
+                data = self._download(IGN, *key)
+                a = self._decode(IGN, *key, data) if data is not None else None
+                if a is not None and np.isfinite(a).all():
+                    self.served[key] = IGN["name"]
+                    return a
+                self._partial()       # never cache a temporary fallback as a complete IGN tile
+                fallback = self._make_global_tile(key)
+                if a is not None and np.isfinite(a).any():
+                    self.served[key] = IGN["name"]
+                    return np.where(np.isfinite(a), a, fallback).astype(np.float32)
+                return fallback
+            except netfetch.FetchError as exc:
+                self._count("ign-rge-alti:failover")
+                self._partial()
+                log.debug("IGN %s unavailable: %s; global fallback", key, exc)
+        return self._make_global_tile(key)
+
+    def _make_global_tile(self, key):
         return self._canada(key, self._make_tile0(key))
 
     def _make_tile0(self, key):

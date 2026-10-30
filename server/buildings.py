@@ -318,6 +318,24 @@ def oriented_box(p):
 
 # ------------------------------------------------------------------------------------------- the model
 
+def box_walls_fit(ring, tolerance=0.10):
+    """A pitched-roof box may not move a mapped wall more than ten centimetres.
+
+    Area coverage alone accepts skewed quadrilaterals and fills their corners into
+    neighbouring streets (Rue Melchior-de-Vogue: 2.26 m toward the carriageway).
+    """
+    c, u, hl, hw = oriented_box(ring)
+    v = np.array([-u[1], u[0]])
+    local = np.c_[(ring - c) @ u, (ring - c) @ v]
+    if np.minimum(np.abs(np.abs(local[:, 0]) - hl), np.abs(np.abs(local[:, 1]) - hw)).max() > tolerance:
+        return False
+    corners = np.array([c + sx * hl * u + sy * hw * v for sx, sy in ((-1,-1),(1,-1),(1,1),(-1,1))])
+    ab = np.roll(ring, -1, axis=0) - ring
+    t = np.clip(((corners[:, None] - ring) * ab).sum(2) / np.maximum((ab * ab).sum(1), 1e-12), 0, 1)
+    distance = np.linalg.norm(corners[:, None] - (ring + t[:, :, None] * ab), axis=2).min(1)
+    return bool((distance <= tolerance).all())
+
+
 class Spec:
     """What is built for one footprint (decided by plan())."""
     __slots__ = ("ring", "floors", "floor_h", "height", "roof", "roof_mat", "facade", "band", "shop", "plain", "min_h", "wall", "door", "windows", "front", "steeple", "stoop",
@@ -584,6 +602,8 @@ def plan(ring, attrs, neighbours=0, lat=None, lon=None, look=None, town=False, d
     if roof != "flat" and (box_fill < (0.6 if church else 0.8) or hw < 2.0
                            or hw > (18.0 if barn else 20.0 if church else 14.0)):
         roof = "flat"
+    if roof != "flat" and not box_walls_fit(ring):
+        roof = "flat"     # the polygon extrusion preserves both visible walls and collision outline
     # a city tower's ground floor is shops or a lobby (Midtown, 2026-10-14: most towers have no class, and their
     # curtain wall came down to the pavement)
     tall = (nf or (h or 0) / FLOOR_M) >= TOWER_SHOP_FLOORS

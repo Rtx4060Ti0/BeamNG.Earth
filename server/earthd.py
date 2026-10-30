@@ -436,6 +436,8 @@ RETEX_INFLIGHT = 1
 RETEX_REPEAT = 3
 # Shown in the mod's UI (V1_3_SPEC §C), after the imagery credits.
 ELEVATION_CREDIT = "Elevation: Mapterhorn (see mapterhorn.com/attribution), AWS Terrain Tiles / Mapzen"
+if os.environ.get("BNE_DEM_SOURCE", "").lower() == "ign":
+    ELEVATION_CREDIT += "; France: IGN RGE ALTI / Geoplateforme (Licence Ouverte 2.0)"
 
 log = logging.getLogger("earthd")
 
@@ -1286,22 +1288,11 @@ class Server:
             return None
         if self.road_pool is not None:
             t0 = time.perf_counter()
-            fut = self.road_pool.submit(
+            res = self.road_pool.run_bounded(ROAD_TILE_TIMEOUT_S,
                 blockworker.roads_tile, aid, anchor.lat, anchor.lon, anchor.zooms[0], tx, ty, self.out_dir,
                 self.vfs_dir, self.sidewalks, DETAIL_ROAD_LIFT if self.near_visual == "detail" else 0.0,
                 self.buildings, self.left_hand(anchor), self.mph(anchor), self.anchor_q(anchor),
                 self.gas_stations, self.buried(anchor), self.lamp_region(anchor), self.country(anchor))
-            try:
-                # bounded: a worker that never answered held this thread and its roads.Tracker slot for good (4
-                # slots: four hung tiles and no road tile ever again, the loading line at "roads & buildings 0/26")
-                res = fut.result(timeout=ROAD_TILE_TIMEOUT_S)
-            except concurrent.futures.TimeoutError:
-                fut.cancel()
-                log.warning("road tile %d_%d of anchor %d: no answer from its worker in %.0f s: built again",
-                            tx, ty, aid, ROAD_TILE_TIMEOUT_S)
-                if hasattr(self.road_pool, "recycle"):
-                    self.road_pool.recycle(f"road tile {tx}_{ty} hung for {ROAD_TILE_TIMEOUT_S:.0f} s")
-                raise
             log.debug("road tile %d_%d: %.2f s (queue + build)", tx, ty, time.perf_counter() - t0)
             self.keep_fuel_pads(res[2])
             return res[:2]
@@ -1412,7 +1403,7 @@ class Server:
             deck_parts)
         mesh = roadmeshmod.build(anchor.frame, chunks, elev, (x0, y0, 0.0),
                                  DETAIL_ROAD_LIFT if self.near_visual == "detail" else 0.0,
-                                 clip=box, follow=True, q=self.anchor_q(anchor), drawn=drawn)
+                                 clip=box, follow=True, q=self.anchor_q(anchor), drawn=drawn, context=ctx)
         mesh = blockworker._with_plazas(mesh, anchor.frame, tx, ty, elev, (x0, y0, 0.0), self.surface)
         dmesh = roadmeshmod.deck(chunks, (x0, y0, 0.0),
                                  anchor.bridges.piers_in(roadsmod.tile_bbox(tx, ty)) if anchor.bridges is not None else (),
@@ -3292,8 +3283,10 @@ class Connection:
             lat, lon = float(msg["lat"]), float(msg["lon"])
         except (KeyError, TypeError, ValueError):
             return
-        out = {"type": "where_result", "id": msg.get("id"), "street": ""}
+        out = {"type": "where_result", "id": msg.get("id"), "street": "", "nearby": ""}
         loop = asyncio.get_running_loop()
+        import france_local
+        out["nearby"] = await loop.run_in_executor(self.s.ui_pool, france_local.nearby_label, lat, lon)
         if self.s.surface is not None:
             def street():
                 layers, _ = self.s.surface.roads(lat, lon)

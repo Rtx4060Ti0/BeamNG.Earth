@@ -197,6 +197,7 @@ UNDER_CLEAR_M = roadsmod.DECK_ROAD_CLEAR + ROAD_LIFT
 UNDER_GRADE = 0.06          # the dip's ramps
 UNDER_MAX_BRIDGE_M = 120.0  # only single short spans (both ends on the ground): a chain's inner ends are no abutments
 UNDER_MAX_DROP_M = 8.0      # never lowered more than this (bad data: rather a low bridge than a pit)
+UNDER_DRY_FLOOR_M = 0.25   # never infer an excavation below the game's sea surface from an above-sea DEM
 UNDER_FLAT_M = 12.0         # m either side of the crossing kept at the dip's full depth (under_dip)
 UNDER_MAX_GRADE = 0.10      # a dip's ramp made steeper, up to this, to end inside its road part (under_dip)
 UNDER_JOINT_FLAT_M = 12.0   # at a junction, every road takes the deepest dip within this of it ...
@@ -737,6 +738,7 @@ class Grader:
         self.covers = {}        # cell key -> [(xy (k, 2), half width)]: the tunnels whose ground over them stays
         self.keeps = {}         # cell key -> [(xy (k, 2), half width)]: the UNGRADED roads' carriageways
         self.opens = {}         # cell key -> [(xy (k, 2), Spec)]: the tunnels' open sections (roads in the open)
+        self.crossovers = {}   # surface carriageways over explicitly mapped underpasses
         self.shared = None      # plancache.PlanCache: the cells' plans shared with the server's other processes
         self.wet = None         # wet(lat, lon) -> water depth (m): tunnels under water are left out, as
                                 # roads.TunnelProfiles leaves them (their "open" sections graded a dam across the river:
@@ -795,6 +797,8 @@ class Grader:
             box = self._clip_box(key)
             keeps = []
             for i in range(len(feats)):
+                if specs[i] is not None and specs[i].cls in roadsmod.NON_MOTOR:
+                    continue
                 if specs[i] is not None and specs[i].cls in UNGRADED:
                     for ring in roadsmod.ground_parts(feats, i):
                         e, n, _ = self.frame.geodetic_to_enu(ring[:, 1], ring[:, 0], 0.0)
@@ -898,6 +902,9 @@ class Grader:
             # every plan only within the cell's own box, so each stretch of road is planned by one cell (its dips
             # made with every road around: _lower_underpasses); the tunnels' ends graded as before, a part shorter
             # than LONG_PART_M by all of it (TunnelProfiles.ends grades them by the roads' plans alone)
+            # Repair the complete approach before clipping it into cell pieces;
+            # both the ground and the tunnel's endpoint profiles must see it.
+            self._repair_tunnel_portals(feats, plans)
             tplans = plans
             if own is not None:
                 kept, tplans = [], []
@@ -914,7 +921,209 @@ class Grader:
             opens = [(xy, spec) for _f, spec, xy, _z, k in secs if k == 0]
         else:
             covers, opens, keeps = [], [], []
+        import roadqa
+        roadqa.record(self.frame, "road_cell:" + str(key),
+                      ((fid, p.xy, p.z, "") for fid, p in plans))
         return plans, keeps, covers, opens
+
+    def _ensure_crossovers(self, keys):
+        # Derived from loaded plans too: persistent/shared plan caches must obey this rule.
+        for key in keys:
+            with self.lock:
+                if key in self.crossovers:
+                    continue
+                plans = self.cells.get(key)
+            if plans is None:
+                continue
+            # Rails on the surface own their level too. Excluding them lets a
+            # DEM sample of the lower road pull the track and its collidable
+            # ballast into the bore (Saint-Vallier's south portal).
+            ground = [p for fid, p in plans if TUNNEL_TAG not in fid]
+            spans = list(self.covers.get(key, ()))
+            spans.extend((xy, sp.width / 2 + TUNNEL_KEEP_M) for xy, sp in self.opens.get(key, ()))
+            result = self._surface_crossings(spans, ground)
+            with self.lock:
+                self.crossovers.setdefault(key, result)
+
+    def _surface_crossings(self, covers, road_plans):
+        """A surface road or railway owns its corridor above an explicit tunnel, even when a coarse DEM
+        cannot resolve the two levels. The lower road's approaches must not dig a trench through it.
+        Keep only a short piece around each crossing, so normal junction grading elsewhere is unchanged.
+        """
+        out = []
+        # These covered footprints are part of the shared plan cache. Do not
+        # fetch OSM cells again when a previously prepared place is revisited.
+        for xy, half in covers:
+            xy = np.asarray(xy, np.float64)
+            if len(xy) < 2:
+                continue
+            repair = max(half - TUNNEL_KEEP_M, 0.) + 3 * SIGMA_M
+            lo, hi = xy.min(0), xy.max(0)
+            for p in road_plans:
+                if p.bbox[2] < lo[0] or p.bbox[0] > hi[0] or p.bbox[3] < lo[1] or p.bbox[1] > hi[1]:
+                    continue
+                # End touches are the tunnel's own approaches, not an upper road.
+                s = np.r_[0.0, np.cumsum(np.hypot(*np.diff(p.xy, axis=0).T))]
+                crossings = sorted({round(float(sp), 6) for _pi, sp, q in
+                                    roadsmod._crossings([p.xy], [xy]) if 1.0 < sp < s[-1] - 1.0
+                                    and min(np.linalg.norm(q - xy[0]), np.linalg.norm(q - xy[-1])) > 1.0})
+                if not crossings:
+                    continue
+                for sp in crossings:
+                    # The DEM often resolves the lower road and leaves a false dip in the
+                    # upper one. Bridge it from the undisturbed profile beyond the smoother's
+                    # footprint instead of smoothing the lower road's elevation into it.
+                    a, b = max(0.0, sp - repair), min(s[-1], sp + repair)
+                    start, end = max(0.0, a - T_MAX), min(s[-1], b + T_MAX)
+                    local_s = np.r_[start, s[(s > start) & (s < end)], end]
+                    local_xy = np.c_[np.interp(local_s, s, p.xy[:, 0]), np.interp(local_s, s, p.xy[:, 1])]
+                    z = np.interp(local_s, s, p.z)
+                    inside = (local_s >= a) & (local_s <= b)
+                    z[inside] = np.maximum(z[inside], np.interp(local_s[inside], [a, b],
+                                                             np.interp([a, b], s, p.z)))
+                    out.append(Plan(local_xy, z, p.half))
+        return out
+
+    def _surface_over_tunnels(self, e, n, base, lift, keys):
+        """Restore only the upper carriageway at grade-separated crossings. A narrow shoulder fade
+        leaves the tunnel portals at the lower road's approach height.
+        """
+        self._ensure_crossovers(keys)
+        with self.lock:
+            unique = {}
+            for key in keys:
+                for p in self.crossovers.get(key, ()):
+                    unique.setdefault((p.half, p.xy.tobytes(), p.z.tobytes()), p)
+            plans = [unique[key] for key in sorted(unique)]
+        if not plans or not len(e):
+            return base
+        x0, y0, x1, y1 = e.min(), n.min(), e.max(), n.max()
+        plans = [p for p in plans if not (p.bbox[2] < x0 or p.bbox[0] > x1 or p.bbox[3] < y0 or p.bbox[1] > y1)]
+        if not plans:
+            return base
+        weight = np.zeros(len(e))
+        for p in plans:
+            lo, hi = p.xy.min(0) - p.half - WALL_T_M, p.xy.max(0) + p.half + WALL_T_M
+            ii = np.flatnonzero((e >= lo[0]) & (e <= hi[0]) & (n >= lo[1]) & (n <= hi[1]))
+            if not len(ii):
+                continue
+            points = np.c_[e[ii], n[ii]]
+            distances = roadsmod._seg_dist(points, p.xy[:-1], p.xy[1:])
+            nearest = distances.argmin(1)
+            distance = distances[np.arange(len(ii)), nearest]
+            ab = np.diff(p.xy, axis=0)
+            lengths = np.hypot(*ab.T)
+            arc = np.r_[0.0, np.cumsum(lengths)]
+            t = np.clip(((points - p.xy[nearest]) * ab[nearest]).sum(1) /
+                        np.maximum(lengths[nearest] ** 2, 1e-12), 0.0, 1.0)
+            along = arc[nearest] + t * lengths[nearest]
+            v = np.clip(np.minimum(along, arc[-1] - along) / T_MAX, 0.0, 1.0)
+            u = np.clip((distance - p.half) / WALL_T_M, 0.0, 1.0)
+            weight[ii] = np.maximum(weight[ii], (1 - u * u * (3 - 2 * u)) * v * v * (3 - 2 * v))
+        ii = np.flatnonzero(weight > 0)
+        if not len(ii):
+            return base
+        target = grade_points(e[ii], n[ii], base[ii], plans, lift)
+        out = base.copy()
+        out[ii] += weight[ii] * (target - out[ii])
+        return out
+
+    def _repair_tunnel_portals(self, feats, plans):
+        """Remove a cliff sampled at a portal using a stable, connected approach.
+
+        Follow mapped surface roads outwards before sampling: a short segment at
+        the mouth may be entirely on the embankment. Unconnected roads and real
+        steep/irregular approaches are left alone. No off-road extrapolation.
+        """
+        ends, lines = [], []
+        for i, sp in enumerate(roadsmod.tunnel_specs(feats)):
+            if sp is not None:
+                for ring in roadsmod.tunnel_parts(feats, i):
+                    e, n, _ = self.frame.geodetic_to_enu(ring[[0, -1], 1], ring[[0, -1], 0], 0.0)
+                    ends.extend(np.c_[e, n])
+        if not ends:
+            return
+        specs = {str(feats.ids[i]): sp for i, sp in enumerate(roadsmod.road_specs(feats)) if sp is not None}
+        for i, fid in enumerate(feats.ids):
+            sp = specs.get(str(fid))
+            if sp is not None and sp.kind in roadsmod.BUILT:
+                for ring in roadsmod.ground_parts(feats, i):
+                    e, n, _ = self.frame.geodetic_to_enu(ring[:, 1], ring[:, 0], 0.0)
+                    xy = np.c_[e, n]
+                    if len(xy) >= 2:
+                        lines.append(xy)
+        repairs = []
+        for portal in ends:
+            for j, line in enumerate(lines):
+                distances = np.linalg.norm(line[[0, -1]] - portal, axis=1)
+                if distances.min() >= 1.5:
+                    continue
+                chain = line.copy() if distances[0] <= distances[1] else line[::-1].copy()
+                seen = {j}
+                for _ in range(12):
+                    if np.linalg.norm(np.diff(chain, axis=0), axis=1).sum() >= 50.:
+                        break
+                    direction = chain[-1]-chain[-2]
+                    direction /= max(np.linalg.norm(direction), 1e-6)
+                    candidates = []
+                    for k, other in enumerate(lines):
+                        if k in seen:
+                            continue
+                        for candidate in (other, other[::-1]):
+                            if np.linalg.norm(candidate[0]-chain[-1]) < 1.5:
+                                v = candidate[1]-candidate[0]
+                                alignment = float(v@direction)/max(np.linalg.norm(v), 1e-6)
+                                if alignment > .5:
+                                    candidates.append((alignment, k, candidate))
+                    if not candidates:
+                        break
+                    _, k, candidate = max(candidates, key=lambda item: item[0])
+                    chain = np.concatenate([chain, candidate[1:]])
+                    seen.add(k)
+                xy, d = resample(chain, PROFILE_STEP)
+                la, lo, _ = self.frame.enu_to_geodetic(xy[:, 0], xy[:, 1], 0.)
+                raw = np.asarray(self.elev(la, lo), np.float64)
+                for low, high in ((24., 48.), (12., 24.)):
+                    fit = (d >= low) & (d <= high) & np.isfinite(raw)
+                    if fit.sum() < 3 or np.ptp(d[fit]) < 6.:
+                        continue
+                    slope, intercept = np.polyfit(d[fit], raw[fit], 1)
+                    if (abs(slope) > .12 or np.max(np.abs(raw[fit]-(intercept+slope*d[fit]))) > .6
+                            or not np.isfinite(raw[0]) or raw[0]-intercept <= 2.):
+                        continue
+                    repairs.append((chain, low, slope, intercept))
+                    break
+        for fid, p in plans:
+            if not repairs or len(p.xy) < 2:
+                continue
+            plan_s = np.r_[0., np.cumsum(np.linalg.norm(np.diff(p.xy, axis=0), axis=1))]
+            step = plan_s[-1]/max(1, math.ceil(plan_s[-1]/PROFILE_STEP-1e-9))*(1.+1e-9)
+            if step <= 0:
+                continue
+            xy, s = resample(p.xy, step)
+            raw = None
+            for chain, reach, slope, intercept in repairs:
+                ab = np.diff(chain, axis=0)
+                lengths = np.linalg.norm(ab, axis=1)
+                arc = np.r_[0., np.cumsum(lengths)]
+                distances = roadsmod._seg_dist(xy, chain[:-1], chain[1:])
+                nearest = distances.argmin(1)
+                t = np.clip(((xy-chain[nearest])*ab[nearest]).sum(1)/np.maximum(lengths[nearest]**2, 1e-12), 0., 1.)
+                along = arc[nearest]+t*lengths[nearest]
+                near = (distances[np.arange(len(xy)), nearest] < .5) & (along < reach)
+                if not near.any():
+                    continue
+                if raw is None:
+                    la, lo, _ = self.frame.enu_to_geodetic(xy[:, 0], xy[:, 1], 0.)
+                    original = np.asarray(self.elev(la, lo), np.float64)
+                    raw = original.copy()
+                raw[near] = intercept+slope*along[near]
+            if raw is not None:
+                sp = specs.get(fid)
+                sigma = profile_sigma(sp) if sp is not None else SIGMA_M
+                repaired = smooth_profile(median_profile(raw, step, MEDIAN_M), step, sigma)
+                previous = smooth_profile(median_profile(original, step, MEDIAN_M), step, sigma)
+                p.z = p.z+np.interp(plan_s, s, repaired-previous)
 
     def _chain_cands(self, key, feats=None, specs=None):
         """The graded ground parts of cell key's roads, as the continuations at a node in it are looked for (every cell
@@ -1373,7 +1582,7 @@ class Grader:
         zc = self._under_ground(lines, [ground[g][1:] for g in gids], cands)
         requirements = []
         for (i, sc, top), z in zip(cands, zc):
-            target = max(top, z - UNDER_MAX_DROP_M)
+            target = underpass_target(z, top, clearance=0.0)
             if target < z - 0.1:
                 requirements.append((i, sc, z - target))
         if not requirements:
@@ -1790,7 +1999,7 @@ class Grader:
                     g = g.copy()
                     pack = PlanPack(list(road_plans)) if pack is None else pack
                     g[[0, -1]] = grade_points(xy[[0, -1], 0], xy[[0, -1], 1], g[[0, -1]], pack)
-                floor, kinds = roadsmod.tunnel_sections(s, g)
+                floor, kinds = roadsmod.tunnel_sections(s, g, continuous=roadsmod.continuous_tunnel(feats, i))
                 kinds = roadsmod.portal_cover(kinds, g - floor, ts[i])
                 if over is None:
                     over = self._roads_over_tunnels(feats, ts)
@@ -1989,6 +2198,8 @@ class Grader:
             # left ungraded under it stood a few cm over the E6's lanes as patches of bare ground, GitHub #2)
             keep &= np.abs(out - base.ravel()) >= OVER_TUNNEL_SMALL_M
             out[keep] = base.ravel()[keep]
+        if not roads_only:
+            out = self._surface_over_tunnels(e, n, out, lift, keys)
         return out.reshape(shape)
 
     def open_tunnels(self, lat, lon):
@@ -2317,6 +2528,21 @@ def fill_abutment(z, at_end, step=PROFILE_STEP):
     q = p.copy()
     q[:n] = np.minimum(np.maximum(p[:n], e), p[:n] + ABUT_MAX_M)
     return q[::-1] if at_end else q
+
+
+def underpass_target(ground, deck, clearance=UNDER_CLEAR_M):
+    """A clearance request cannot turn mapped dry land into a flooded trench.
+
+    Rue Helene Boucher, Montpellier: an estimated low bridge deck lowered a
+    3.4 m road to -4 m. Keep the ground profile when clearance would require
+    crossing sea level; the bridge solver must resolve/report that clearance.
+    Already-below-sea terrain is left to its existing drainage/water modelling.
+    """
+    # clearance=0 when the caller already supplied the usable underside height.
+    target = max(deck - clearance, ground - UNDER_MAX_DROP_M)
+    if ground >= 0.0 and target < UNDER_DRY_FLOOR_M:
+        return ground
+    return target
 
 
 def underpass_offsets(lines, requirements, queries=None):

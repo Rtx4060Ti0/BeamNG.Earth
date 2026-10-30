@@ -412,6 +412,41 @@ def junction_props(roads, box, curb_h=0.15, left_hand=False, decks=(), signals=N
     return rows
 
 
+def no_entry_signs(roads, box, left_hand=False, decks=()):
+    """No-entry faces at the wrong end of a mapped one-way arm at a junction.
+
+    This reconstructs the restriction, not a surveyed sign-post location. Do not
+    infer one-way rules, sign every shape-point, or put signs on a roundabout ring.
+    """
+    import islands
+    ring = islands.ring_fids(roads)
+    lines = [(sp.width / 2, np.asarray(p)[:, :2]) for _,sp,p,_ in roads if len(p)>1]
+    lines += [(float(hw),np.asarray(p)[:,:2]) for p,hw in decks if len(p)>1]
+    x0,y0,x1,y1 = box
+    rows = []
+    for arms in _arms(roads).values():
+        if len(arms)<3:
+            continue
+        for arm in arms:
+            fid,sp,u,c,*_ = arm
+            if fid in ring or not sp.oneway or not sp.dir or _outbound(arm):
+                continue
+            if sp.cls not in MAJOR | MINOR | {"service"}:
+                continue
+            # Ignore a crossing on a different level and a junction with no
+            # other incoming approach from which someone could turn the wrong way.
+            peers=[a for a in arms if a[0]!=fid and abs(float(a[3][2]-c[2]))<2.0]
+            if len(peers)<2 or not any(not _outbound(a) for a in peers):
+                continue
+            right=np.array([u[1],-u[0]]) * (-1 if left_hand else 1)
+            wide=max(a[1].width for a in peers)/2
+            q=signal_spot(c,u,right,wide,sp.width/2,lines)
+            if q is not None and x0<=q[0]<x1 and y0<=q[1]<y1:
+                rows.append(["noentry",round(float(q[0]),2),round(float(q[1]),2),
+                             round(float(c[2]),2),round(_yaw(*right),1),1.,2.6,0.])
+    return rows
+
+
 # The mod's round km/h sign models (trees.lua's speedk<n>, tools/generate_kmh_speed_signs.py; PR #195). Not placed since
 # 2026-10-28: the speed-limit signs are the sign tiles' (speedsigns.py: where the limit changes, past major junctions,
 # drawn in each region's style), which replaced the props that stood 30 m after both ends of every long segment.
@@ -661,6 +696,7 @@ def place(roads, walks, box, curb_h=0.15, wires=None, town=False, left_hand=Fals
                 lambda out: _yaw(-out[0], -out[1]) + BENCH_YAW)
             put(G_BIN, BIN_SPACING, _h01(fid, side, "bin") * BIN_SPACING, 0.7, 1.1, lambda out: _yaw(-out[0], -out[1]))
     rows.extend(junction_props(roads, box, curb_h, left_hand, decks, signals))
+    rows.extend(no_entry_signs(roads, box, left_hand, decks))
     for fid, spec, line, _ in roads:
         if fid in lit or len(line) < 2:
             continue

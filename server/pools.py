@@ -34,7 +34,28 @@ class RespawningPool:
         except BrokenProcessPool:
             return self._renew(pool).submit(fn, *args, **kwargs)
 
-    def _renew(self, broken):
+    def run_bounded(self, seconds, fn, *args, **kwargs):
+        """Do not occupy a road dispatch thread forever on a lost worker result.
+
+        Retire only this pool on timeout; the Tracker retries the unfinished tile.
+        A task that raises TimeoutError itself must not kill healthy workers.
+        """
+        with self._lock:
+            pool = self._pool
+        try:
+            future = pool.submit(fn, *args, **kwargs)
+        except BrokenProcessPool:
+            pool = self._renew(pool)
+            future = pool.submit(fn, *args, **kwargs)
+        try:
+            return future.result(timeout=seconds)
+        except TimeoutError:
+            if future.done():
+                raise
+            self._renew(pool, stalled=True)
+            raise TimeoutError(f"{self.name}: no result after {seconds:g} s; workers restarted, tile will retry")
+
+    def _renew(self, broken, stalled=False):
         with self._lock:
             if self._pool is broken:
                 now = time.monotonic()
@@ -42,8 +63,15 @@ class RespawningPool:
                     raise BrokenProcessPool(f"{self.name} pool broken again within {RESPAWN_S:.0f} s")
                 self._last = now
                 self.respawns += 1
-                log.warning("%s worker process died: its pool made again (%d so far)", self.name, self.respawns)
+                log.warning("%s workers %s: pool made again (%d so far)", self.name,
+                            "timed out" if stalled else "died", self.respawns)
                 try:
+                    if stalled:
+                        # Python 3.10-3.13 have no terminate_workers(). Snapshot before
+                        # shutdown clears _processes; these are this executor's own children.
+                        for process in list((getattr(broken, "_processes", None) or {}).values()):
+                            if process.is_alive():
+                                process.terminate()
                     broken.shutdown(wait=False, cancel_futures=True)
                 except Exception:       # (it is broken already)
                     pass
