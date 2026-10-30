@@ -12,6 +12,12 @@ only, nothing redistributed. Licence notes marked *(verify)* must be re-checked 
 
 ## Map data (downloaded at runtime by the companion server and cached on the player's disk)
 
+The local France profile also uses IGN RGE ALTI through the Geoplateforme WMS
+(`ELEVATION.ELEVATIONGRIDCOVERAGE.HIGHRES`) for terrain elevations in metropolitan
+France and Corsica, with fallback to the global providers where unavailable.
+Attribution: "IGN RGE ALTI / Geoplateforme - Licence Ouverte 2.0".
+This elevation source is separate from the existing IGN BD ORTHO imagery.
+
 | Data | Provider | Used for | Licence / terms | Attribution | Status |
 |---|---|---|---|---|---|
 | Natural Earth v5.1.2: 1:50m country and state / province boundary lines, 1:110m country label points, 1:10m populated places (scalerank <= 8) | Natural Earth (naturalearthdata.com; GeoJSON from github.com/nvkelso/natural-earth-vector) | the world map's Layers: borders and place names (shipped with the mod, `ui/.../maplayers.js`, ~0.7 MB) | public domain | "Made with Natural Earth" (not required) | in use |
@@ -163,6 +169,17 @@ only, nothing redistributed. Licence notes marked *(verify)* must be re-checked 
 - Z. Wang, A. C. Bovik, H. R. Sheikh, E. P. Simoncelli, "Image quality assessment: from error
   visibility to structural similarity", IEEE Trans. Image Processing 13(4), 2004: the SSIM measure
   `tools/benchmark.py compare` uses (own NumPy implementation).
+
+## France profile additions
+
+`mod/beamng_earth/ui/ui-vue/mods/beamngEarth/franceplaces.js` contains settlement
+names and coordinates derived from OpenStreetMap's France extract dated
+2026-10-12. © OpenStreetMap contributors, ODbL 1.0:
+https://www.openstreetmap.org/copyright . The code licence does not replace this
+data licence. IGN RGE ALTI attribution is listed in the elevation table above.
+Shapely (BSD 3-Clause) and GEOS (LGPL 2.1) perform bridge polygon clipping.
+The no-entry artwork is drawn by `tools/generate_noentry_sign.py` and reuses the
+project's existing sign body; no third-party sign photograph is copied.
 
 ## User mods mentioned in the docs (not part of BeamNG.Earth)
 

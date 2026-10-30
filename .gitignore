@@ -30,3 +30,10 @@ dist/
 native/earthfast/target/
 build/
 native/serverlist/target/
+
+# Local France profile data and gameplay diagnostics
+reports/
+bootstrap_mod/
+start_france.py
+local-config.json
+payload-manifest.json
