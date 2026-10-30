@@ -3,6 +3,7 @@ import os
 import sys
 import unittest
 import unittest.mock
+import time
 from concurrent.futures.process import BrokenProcessPool
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
@@ -10,6 +11,18 @@ import pools  # noqa: E402
 
 
 class RespawnTest(unittest.TestCase):
+    def test_stalled_job_releases_dispatch_and_next_job_works(self):
+        p = pools.RespawningPool("bounded test", 1)
+        try:
+            self.assertEqual(p.submit(abs, -1).result(timeout=10), 1)
+            with self.assertLogs("earthd.pools", "WARNING"):
+                with self.assertRaises(TimeoutError):
+                    p.run_bounded(0.1, time.sleep, 30)
+            self.assertEqual(p.run_bounded(10, abs, -8), 8)
+            self.assertEqual(p.respawns, 1)
+        finally:
+            p.shutdown()
+
     def test_a_dead_worker_is_replaced(self):
         p = pools.RespawningPool("test", 1)
         try:

@@ -62,8 +62,10 @@ class WordingTest(unittest.TestCase):
         self.assertEqual(set(credits.IMAGERY), set(imagery.SOURCES))
 
     def test_elevation_and_weather(self):
-        self.assertEqual(set(credits.ELEVATION), {demmod.MAPTERHORN["name"], demmod.AWS["name"], polardem.SOURCE,
-                                                  "lidarbc", "hrdem"})
+        self.assertEqual(set(credits.ELEVATION), {demmod.MAPTERHORN["name"], demmod.AWS["name"],
+                                                  demmod.IGN["name"], polardem.SOURCE, "lidarbc", "hrdem"})
+        self.assertEqual(credits.label("dem:" + demmod.IGN["name"]), "IGN RGE ALTI")
+        self.assertIn("Licence Ouverte 2.0", credits.full_label("dem:" + demmod.IGN["name"]))
         # the open government licences' required wording ("Contains information licensed under ...")
         self.assertIn("Open Government Licence - British Columbia", credits.ELEVATION["lidarbc"])
         self.assertIn("Open Government Licence - Canada", credits.ELEVATION["hrdem"])

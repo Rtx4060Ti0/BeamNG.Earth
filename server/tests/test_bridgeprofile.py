@@ -40,6 +40,30 @@ def flat(h=10.0):
 
 class CurveProfile(unittest.TestCase):
 
+    def test_bank_lift_does_not_end_in_a_vertical_step(self):
+        # An intermediate bank on an inclined 38 m span used to spread its
+        # absolute height to the low end, followed by a multi-metre step.
+        s = np.linspace(0., 38., 39)
+        z = 211.1 - 3.6 * s / s[-1]
+        ground = z + .4 * np.sin(np.pi * s / s[-1]) ** 2
+        floor = ground + roads.DECK_CLEAR
+        out = roads._lift_smooth(s, z, floor)
+        self.assertAlmostEqual(out[0], z[0])
+        self.assertAlmostEqual(out[-1], z[-1])
+        self.assertTrue(np.all(out >= ground - 1e-9))
+        self.assertLessEqual(np.max(np.abs(np.diff(out) / np.diff(s))), roads.DECK_STEEP_GRADE + 1e-9)
+
+    def test_infeasible_bank_keeps_ground_without_amplifying_the_step(self):
+        s = np.linspace(0., 26., 27)
+        z = 172. - 10. * s / s[-1]
+        ground = z + 1.5 * np.sin(np.pi * s / s[-1]) ** 2
+        floor = ground + roads.DECK_CLEAR
+        out = roads._lift_smooth(s, z, floor)
+        required = max((floor[:-1] - z[-1]) / (s[-1] - s[:-1]))
+        self.assertTrue(np.all(out >= ground - 1e-9))
+        self.assertAlmostEqual(out[-1], z[-1])
+        self.assertLessEqual(np.max(np.abs(np.diff(out) / np.diff(s))), required + 1e-9)
+
     def test_overpass_holds_clearance_and_is_smooth(self):
         # (320 m: upstream's road clearance, 6.15 m of headroom + the slab and girders, needs ~140 m at the 6 % cap)
         ln = line(0, 320)

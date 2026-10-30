@@ -59,6 +59,39 @@ def flat(lat, lon):
 
 
 class WalkLevelTest(unittest.TestCase):
+    def test_short_structure_on_long_road_is_not_discarded(self):
+        # Five metres of bridge on a ten kilometre feature is only 0.0005 of
+        # its length. A relative 0.001 cutoff removed its collision deck.
+        f = features([[(0., 0.), (10000., 0.)]], ["motorway"],
+                     flags=[(0, "is_bridge", .5, .5005)])
+        bridge, = roads.bridge_parts(f, 0)
+        self.assertGreater(np.linalg.norm((bridge[-1] - bridge[0]) * [M_LON, M_LAT]), 4.9)
+        self.assertEqual(len(roads.bridge_levels(f, 0)), 1)
+        self.assertEqual(len(roads.ground_parts(f, 0)), 2)
+
+    def test_ground_sidewalk_does_not_cross_a_bridge_lane(self):
+        run = np.c_[np.arange(0., 41., 2.), np.full(21, 1.), np.full(21, 10.)]
+        walk = {"pts":run, "side":1, "w":2., "caps":(False, False)}
+        deck = {"deck":True, "w":8., "n":[[20.,-15.,10.],[20.,15.,10.]]}
+        out = roads.supported_walks(FRAME, flat, [walk], [deck], lambda x,y:np.full(len(x),10.))
+        self.assertEqual(len(out), 2)
+        self.assertLessEqual(out[0]["pts"][-1,0], 16.)
+        self.assertGreaterEqual(out[1]["pts"][0,0], 24.)
+        deck["n"] = [[20.,-15.,16.],[20.,15.,16.]]
+        under = roads.supported_walks(FRAME, flat, [walk], [deck], lambda x,y:np.full(len(x),10.))
+        self.assertEqual(len(under), 1, "a sidewalk under a high bridge must remain")
+        self.assertIs(under[0], walk)
+
+    def test_outer_half_of_sidewalk_needs_ground_support(self):
+        run = np.c_[np.arange(0., 41., 2.), np.full(21, 1.), np.full(21, 10.)]
+        walk = {"pts":run, "side":1, "w":2., "caps":(False, False)}
+        def ground(x,y):
+            return np.where((x>15)&(x<25)&(y>1.5), 6., 10.)
+        out = roads.supported_walks(FRAME, flat, [walk], ground=ground)
+        self.assertEqual(len(out), 2, "a supported curb must not hide a floating outer slab")
+        self.assertLessEqual(out[0]["pts"][-1,0],15.)
+        self.assertGreaterEqual(out[1]["pts"][0,0],25.)
+
     def test_sidewalk_stops_at_a_wall(self):
         """A sidewalk along y = 6 at the road's level 10 m: where the ground under it climbs a wall (x 30..50) it stops."""
         run = np.c_[np.arange(0.0, 81.0, 2.0), np.full(41, 6.0), np.full(41, 10.0)]
@@ -157,7 +190,8 @@ class RulesTest(unittest.TestCase):
                      surfaces=[(4, "gravel")], widths=[(2, 14.0)], levels=[(3, 1.0)], flags=[(5, "is_bridge")])
         s = roads.road_specs(f)
         self.assertEqual(s[0][:2], (roads.STYLE["residential"][0] + 2 * roads.EDGE_STRIP_M, "paved"), "rural: edge strips")
-        self.assertIsNone(s[1], "footways left out")
+        self.assertEqual((s[1].cls, s[1].width), ("footway", 2.0), "footway rendered without road shoulders")
+        self.assertEqual(roads.extras(s[1], np.array([[0.,0.,0.],[10.,0.,0.]]), 4.), [])
         self.assertEqual(s[2][:2], (14.0, "paved"), "width rule")
         self.assertIsNone(s[3], "off ground level (bridge / tunnel) left out")
         self.assertEqual(s[4][:2], (roads.STYLE["track"][0], "gravel"))

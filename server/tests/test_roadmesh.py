@@ -25,6 +25,25 @@ def slope(la, lo):
 
 
 class RoadMeshTest(unittest.TestCase):
+    def test_neighbouring_decks_use_a_common_crossfall(self):
+        a={**chunk("road_asphalt_2lane",8.,[(0,0,10),(20,0,11)]),
+           "deck":True,"fixed":True,"fid":"a","level":1}
+        b={**chunk("road_asphalt_2lane",8.,[(0,4,10.4),(20,4,11.4)]),
+           "deck":True,"fixed":True,"fid":"b","level":1}
+        join=roadmesh.JoinedDeckSurface([a,b,a])
+        xy=np.array([[10.,-4.],[10.,2.],[10.,8.]])
+        za=join.heights(xy,np.full(3,10.5),"a",1)
+        zb=join.heights(xy,np.full(3,10.9),"b",1)
+        self.assertAlmostEqual(za[1],zb[1],places=6,msg="same join from either carriageway")
+        np.testing.assert_allclose(za[:2],[10.1,10.7],atol=1e-6)
+        np.testing.assert_allclose(zb[1:],[10.7,11.3],atol=1e-6)
+        b["level"]=2
+        separate=roadmesh.JoinedDeckSurface([a,b])
+        np.testing.assert_array_equal(separate.heights(xy,np.full(3,10.5),"a",1),np.full(3,10.5))
+        b["level"]=1;b["n"]=[[0,4,16],[20,4,17]]
+        stacked=roadmesh.JoinedDeckSurface([a,b])
+        np.testing.assert_array_equal(stacked.heights(xy,np.full(3,10.5),"a",1),np.full(3,10.5))
+
     def test_ribbons_drape_face_up_and_lift(self):
         chunks = [chunk("road_asphalt_2lane", 6.0, [(0, 0, 0), (40, 0, 0), (80, 20, 0)]),
                   chunk("line_yellow", 0.12, [(0, 0.12, 0), (40, 0.12, 0)])]
@@ -244,7 +263,7 @@ class BridgeTest(unittest.TestCase):
         self.assertAlmostEqual(P[:, 2].max(), 22.0 + roadmesh.PARAPET_H, msg="a parapet on each edge")
         self.assertAlmostEqual(P[:, 2].min(), 20.0 - roadmesh.DECK_DEPTH - roadmesh.GIRDER_D, msg="girders under it")
         Pr, Tr, _, mr, _ = roadmesh.build(FRAME, [deck], lambda la, lo: la, (0, 0, 0))
-        self.assertEqual(mr, ["road_asphalt_2lane"], "the asphalt is in the road mesh ...")
+        self.assertEqual(mr, [roadmesh.DECK_TOP], "the asphalt uses the slab's continuous world texture ...")
         self.assertAlmostEqual(Pr[:, 2].max(), 22.0 + roadmesh.DECK_SKIN, msg="... just over the slab")
 
 
