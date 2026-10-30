@@ -23,7 +23,7 @@ M.WHERE_MIN_S = 2.0
 M.WHERE_PLACE_S = 120
 M.FPS_ALPHA = 0.05
 
-local loc = { street = '', place = '', region = '', country = '' }
+local loc = { street = '', place = '', region = '', country = '', nearby = '' }
 local last = nil           -- { x, y, t, px, py, pt } of the last request (street / place)
 local nextId = 0
 local fps = nil
@@ -41,6 +41,7 @@ function M.compose(l, loading, f)
     if v ~= nil and v ~= '' and v ~= where[#where] then where[#where + 1] = v end
   end
   if #where > 0 then parts[#parts + 1] = table.concat(where, ', ') end
+  if l and l.nearby and l.nearby ~= '' then parts[#parts + 1] = l.nearby end
   if loading and loading ~= '' then parts[#parts + 1] = loading end
   if f then parts[#parts + 1] = string.format('%d fps', math.floor(f + 0.5)) end
   return table.concat(parts, M.SEP)
@@ -84,7 +85,7 @@ function M.request(now, player, online)
     pt = last and last.pt }
   if placeDue then last.plat, last.plon, last.pt = player.lat, player.lon, now end
   -- a jump (a teleport): the old street and place go at once
-  if moved ~= math.huge and moved > M.JUMP_M then loc = { street = '', place = '', region = '', country = '' } end
+  if moved ~= math.huge and moved > M.JUMP_M then loc = { street = '', place = '', region = '', country = '', nearby = '' } end
   nextId = nextId + 1
   M.requests = M.requests + 1
   return { type = 'where', id = nextId, lat = player.lat, lon = player.lon, online = placeDue and true or false }
@@ -93,7 +94,9 @@ end
 -- The server's where_result: the street always, the place parts when it sent them.
 function M.onResult(msg)
   if type(msg) ~= 'table' then return end
+  if msg.id ~= nil and msg.id < nextId then return end
   if msg.street ~= nil then loc.street = tostring(msg.street) end
+  if msg.nearby ~= nil then loc.nearby = tostring(msg.nearby) end
   if msg.place ~= nil or msg.country ~= nil then
     loc.place, loc.region, loc.country = msg.place or '', msg.region or '', msg.country or ''
   end
@@ -103,7 +106,7 @@ function M.location() return loc end
 
 -- A teleport or a new level: the old place goes.
 function M.reset()
-  loc = { street = '', place = '', region = '', country = '' }
+  loc = { street = '', place = '', region = '', country = '', nearby = '' }
   last = nil
 end
 

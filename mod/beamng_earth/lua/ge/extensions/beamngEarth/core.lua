@@ -70,6 +70,7 @@ local banner = require('beamngEarth/banner') -- the connection banner (docs/DEVT
 local hudapps = require('beamngEarth/hudapps') -- the same three as BeamNG UI apps (the ".Earth" app layout)
 local edgeguard = require('beamngEarth/edgeguard') -- never fall off the last block (docs/ROADMAP.md)
 local drophold = require('beamngEarth/drophold') -- a car dropped far away waits for its ground
+local simhold = require('beamngEarth/simhold')
 local groundcover = require('beamngEarth/groundcover') -- grass on the surface layers (docs/ROADMAP.md v1.5)
 local roads = require('beamngEarth/roads') -- DecalRoads from the server's road tiles (docs/ROADMAP.md v1.6)
 local sea = require('beamngEarth/sea') -- the sea's WaterBlock tiles (server seatiles.py)
@@ -163,6 +164,7 @@ local updateHidden = false   -- the notice closed for this session (its releases
 local cacheClears = 0         -- answers to a clear so far (the settings page waits for the next one)
 
 local function resetState()
+  if st and st.placeWait and st.placeWait.pausedByUs and simhold.paused() then simhold.pause(false) end
   loadprogress.reset()
   st = {
     inOurLevel = false,
@@ -297,7 +299,7 @@ end
 
 -- Where the player will be, in the new frame, when the rebase commits: the new anchor is the
 -- player's position now, and the commit comes once the distance reaches rebase.distance.
--- M4 stale-anchor rule (rebase.KEEP_EDGE > 0, the 512² block): at or past the distance (a re-request
+-- M4 stale-anchor rule (rebase.KEEP_EDGE > 0, the 512Â² block): at or past the distance (a re-request
 -- after a stale anchor was discarded) the terrain goes where the player will be when the answer
 -- arrives, p + v * (measured anchor latency + 1 s), so a slow server cannot make it stale forever.
 -- (dx, dy): the player's spot in the new frame when its anchor is not the player's position (snapped: rebaseAnchor)
@@ -490,6 +492,11 @@ local function commitTeleport(msg)
   if veh then
     veh:setClusterPosRelRot(-1, st.placeX, st.placeY, st.placeZ + PRE_LIFT, 0, 0, 0, 1)
     veh:applyClusterVelocityScaleAdd(-1, 0, 0, 0, 0)
+    -- Transfer an earlier automatic hold to this new placement; a user's pause stays theirs.
+    if st.guard and st.guard.pausedByUs then edgeguard.release(st.guard) end
+    if st.placeWait and st.placeWait.pausedByUs then simhold.pause(false) end
+    st.placeWait = require('beamngEarth/placementwait').new(simhold.paused())
+    if st.placeWait.pausedByUs then simhold.pause(true) end
   end
   be:reloadCollision()
 
@@ -848,7 +855,7 @@ local function onMessage(msg)
     -- the on-screen credits: this session's own follow (the attribution line until then)
     credits.clear()
     -- M4: the terrain block size first (everything below may use the lattice / follow table); a
-    -- server without hello.blockSize has the v1.3.1 1024² block
+    -- server without hello.blockSize has the v1.3.1 1024Â² block
     local size, okSize = M.setBlockSize(msg.blockSize or 1024)
     if not okSize then
       setStatus('Unsupported terrain block size ' .. tostring(msg.blockSize) .. ': using ' .. size)
@@ -1162,7 +1169,6 @@ M.dropHoldState = function() return dropHold end      -- (tests, tools)
 -- strained it (its damage rose 0 -> 93k in 7 s of holding, the user 2026-10-18: "the hold seems to damage my car",
 -- "can you use the actual pause system"). Resumed only if the hold paused it; the player resuming it ends the hold.
 -- (in a BeamMP session: our own car held, not every car on the screen: simhold.lua)
-local simhold = require('beamngEarth/simhold')
 local function simPause(on) simhold.pause(on) end
 local function simPaused() return simhold.paused() end
 
@@ -1276,12 +1282,55 @@ local function notePlayerPos(force)
   end
 end
 
-local function updateWorld(dt)
+local updateWorld
+do -- keep the pose helper out of the main chunk's 200-local limit
+local function sendPose(dt, pl, c)
+  st.poseTimer = st.poseTimer + dt
+  -- Only report positions in the committed frame, never between the two rebase phases.
+  if st.poseTimer < POSE_INTERVAL or not net.isConnected() or not anchorKnown() or st.rebasing then return end
+  st.poseTimer = 0
+  net.send({ type = 'pose', anchorId = st.anchorId, x = pl.x, y = pl.y, z = pl.z, vx = pl.vx, vy = pl.vy,
+    lat = pl.lat, lon = pl.lon, speed = pl.speed, follow = not st.followHeld,
+    held = (farfield.session() == st.sessionId) and farfield.heldAnchors() or {},
+    sessions = farfield.heldSessions(), slotsGone = slotsGoneNow(), foci = poseFoci(),
+    cam = c and { x = c.x, y = c.y, z = c.z, fx = c.fx, fy = c.fy, fz = c.fz, fovDeg = c.fovDeg, h = c.h } or nil })
+end
+
+updateWorld = function(dt)
   if st.floorZ and not st.placeFrames then M.floorCheck() end
   if st.placedAt and not st.placeFrames then M.fallGuard() end
   if st.placeFrames then
+    -- Road construction starts on a pose. Waiting for colliders before sending the
+    -- first pose deadlocks every cold start / teleport. Keep requesting the target
+    -- while physics is paused; a cluster move's transient velocity is not motion.
+    if st.anchor then
+      local x, y, z = st.placeX or 0, st.placeY or 0, st.placeZ or 0
+      local lat, lon = st.anchor:worldToGeodetic(x, y, z)
+      sendPose(dt, { x = x, y = y, z = z, lat = lat, lon = lon, vx = 0, vy = 0, speed = 0 })
+    end
     st.placeFrames = st.placeFrames - 1
     if st.placeFrames <= 0 then
+      local h = st.placeWait
+      if h then
+        local ready = not net.isConnected() or roads.readyAround(st.anchorId, st.placeX or 0, st.placeY or 0, 8)
+        local act = require('beamngEarth/placementwait').step(h, ready, simhold.paused())
+        if not act then st.placeFrames = 1; return end
+        -- Terrain elevation is the valley floor under a viaduct. Only after the
+        -- deck collides may the car be placed on its top. Tunnel floors retain
+        -- their own floorCheck instead of being snapped onto an upper road.
+        if act == 'place' and ready and not st.floorZ and rawget(_G, 'castRayStatic') then
+          local from = vec3(st.placeX or 0, st.placeY or 0, st.placeZ + 600)
+          local d = castRayStatic(from, vec3(0,0,-1), 1200)
+          if d and d < 1200 then st.placeZ = from.z - d + 1.0 end
+        end
+        if simhold.carHeld() and h.pausedByUs then simhold.pause(false) end
+        st.placeFrames = nil
+        placePlayer(st.placeZ)
+        if h.pausedByUs and simhold.paused() then simhold.pause(false) end
+        st.placeWait = nil
+        log('I', 'beamngEarth', 'initial placement: ' .. (act == 'place' and 'local colliders ready' or 'resumed by player'))
+        return
+      end
       st.placeFrames = nil
       placePlayer(st.placeZ)
     end
@@ -1299,25 +1348,7 @@ local function updateWorld(dt)
   if not pl then return end
   notePlayerPos(false)          -- (every places.POS_EVERY_S at most, once moved POS_MOVE_M)
 
-  st.poseTimer = st.poseTimer + dt
-  -- no pose before the resync with a restarted server commits (anchorKnown; hello named the
-  -- session folders meanwhile)
-  -- nor between a rebase's two phases (st.rebasing): the car is already in the new frame while st.anchorId is still the
-  -- old one, and the server, reading that position in the old frame, dropped every road tile around the car at each
-  -- rebase (2026-10-17, 100 mph on the salt flats: 42 road tiles -> 0 at the rebase)
-  if st.poseTimer >= POSE_INTERVAL and net.isConnected() and anchorKnown() and not st.rebasing then
-    st.poseTimer = 0
-    local c = st.cam
-    -- held: previous anchors of this server's session only (the far field's older sessions' anchor
-    -- ids are another server's); sessions: every session folder in use
-    net.send({ type = 'pose', anchorId = st.anchorId, x = pl.x, y = pl.y, z = pl.z, vx = pl.vx, vy = pl.vy,
-      lat = pl.lat, lon = pl.lon, speed = pl.speed, follow = not st.followHeld,
-      held = (farfield.session() == st.sessionId) and farfield.heldAnchors() or {},
-      sessions = farfield.heldSessions(),
-      slotsGone = slotsGoneNow(), -- pooled shape slots let go (server/matslots.py)
-      foci = poseFoci(),          -- other vehicles' collision islands (collisionfoci.lua; earthd parse_foci)
-      cam = c and { x = c.x, y = c.y, z = c.z, fx = c.fx, fy = c.fy, fz = c.fz, fovDeg = c.fovDeg, h = c.h } or nil })
-  end
+  sendPose(dt, pl, st.cam)
 
   -- a resync the server could not build (anchor_error: offline, never visited) is asked again
   if st.resync and not st.pending and st.sessionId and st.clock >= st.retryAt then
@@ -1431,6 +1462,8 @@ local function updateWorld(dt)
     if not st.terrainPending.ready then w.server = w.server + 1 else w.gate = w.gate + 1 end
   end
 end
+
+end -- updateWorld pose helper scope
 
 ------------------------------------------------------------------------------------------
 -- robustness: the edge guard and the connection banner (docs/ROADMAP.md "Robustness" 1, 2)
@@ -2165,6 +2198,7 @@ end
 M.onFilesChanged = onFilesChanged
 
 local function onExtensionUnloaded()
+  if st.placeWait and st.placeWait.pausedByUs and simhold.paused() then simhold.pause(false) end
   hudapps.unhookCityZone()
   hudapps.unhookMinimapNorth()
   groundcover.enginePatch(false)

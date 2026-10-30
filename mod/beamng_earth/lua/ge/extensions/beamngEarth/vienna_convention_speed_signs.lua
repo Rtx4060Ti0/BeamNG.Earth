@@ -34,6 +34,7 @@ end
 
 for _, limit in ipairs(M.LIMITS) do add(M.group(limit), 'sign_speed' .. limit .. 'kph') end
 add(M.NONE, 'sign_speed_none')
+add('noentry', 'sign_no_entry')
 
 -- trees: trees.lua's module. Its CATALOG and GROUP_MAX_M take the signs' entries.
 function M.install(trees)
